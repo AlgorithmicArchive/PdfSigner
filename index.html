@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PDF Signing Test</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 20px;
+        }
+        #status {
+            margin-top: 10px;
+            color: #333;
+        }
+        #uploadBtn {
+            padding: 10px 20px;
+            background-color: #007bff;
+            color: white;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+        }
+        #uploadBtn:hover {
+            background-color: #0056b3;
+        }
+        #fileInput {
+            display: none;
+        }
+    </style>
+</head>
+<body>
+    <h1>PDF Signing Test</h1>
+    <input type="file" id="fileInput" accept="application/pdf">
+    <button id="uploadBtn">Upload and Sign PDF</button>
+    <div id="status"></div>
+
+    <script>
+        const fileInput = document.getElementById('fileInput');
+        const uploadBtn = document.getElementById('uploadBtn');
+        const statusDiv = document.getElementById('status');
+
+        // Trigger file input click when button is clicked
+        uploadBtn.addEventListener('click', () => {
+            fileInput.click();
+        });
+
+        // Handle file selection and signing
+        fileInput.addEventListener('change', async () => {
+            const file = fileInput.files[0];
+            if (!file) {
+                statusDiv.textContent = 'No file selected.';
+                return;
+            }
+            if (!file.type.includes('pdf')) {
+                statusDiv.textContent = 'Please select a PDF file.';
+                return;
+            }
+
+            // Prompt user for the full path (browser doesn't provide it)
+            const originalPath = prompt('Please enter the full path to the PDF file (e.g., C:\\Users\\YourName\\Documents\\document.pdf):', file.name);
+            if (!originalPath) {
+                statusDiv.textContent = 'No path provided. Signing cancelled.';
+                return;
+            }
+
+            statusDiv.textContent = 'Sending PDF to signing agent...';
+            const formData = new FormData();
+            formData.append('pdf', file, file.name);
+            formData.append('original_path', originalPath);
+
+            try {
+                const response = await fetch('http://localhost:8000/sign', {
+                    method: 'POST',
+                    body: formData
+                });
+
+                if (response.ok) {
+                    statusDiv.textContent = `PDF signed and overwritten at ${originalPath}`;
+                } else {
+                    const errorText = await response.text();
+                    statusDiv.textContent = `Signing failed: ${errorText}`;
+                }
+            } catch (error) {
+                statusDiv.textContent = 'Error: Ensure the signing agent is running on localhost:8000 and the USB token is connected.';
+                console.error('Error signing PDF:', error);
+            }
+        });
+    </script>
+</body>
+</html>
