@@ -130,18 +130,15 @@ class SignPDFApp(QWidget):
     def process_sign_queue(self):
         """Process items in the signing queue."""
         while not self.sign_queue.empty():
-            ID, input_path, original_path, event = self.sign_queue.get()
+            ID, input_path, original_path, pin, event = self.sign_queue.get()
             if not self.lib_path:
                 with self.sign_lock:
                     self.sign_results[ID] = ("Library path not configured", None)
                 event.set()
                 continue
-            pin, ok = QInputDialog.getText(
-                self, 'Enter PIN', 'USB Token PIN:', QLineEdit.Password
-            )
-            if not ok or not pin:
+            if not pin:
                 with self.sign_lock:
-                    self.sign_results[ID] = ("User cancelled", None)
+                    self.sign_results[ID] = ("PIN not provided", None)
                 event.set()
                 continue
             try:
@@ -190,6 +187,8 @@ class SignPDFApp(QWidget):
                 pkcs11.Attribute.CERTIFICATE_TYPE: pkcs11.CertificateType.X_509,
                 pkcs11.Attribute.ID: b'\x01',
             }), None)
+            if not priv_obj or not cert_obj:
+                raise RuntimeError("Private key or certificate not found on token.")
             cert = load_der_x509_certificate(cert_obj[pkcs11.Attribute.VALUE], default_backend())
             key = PKCS11PrivateKey(priv_obj, session)
             attrs = cert.subject.get_attributes_for_oid(ObjectIdentifier('2.5.4.3'))
@@ -298,6 +297,7 @@ class MyRequestHandler(BaseHTTPRequestHandler):
         parts = body.split(b'--' + boundary)
         pdf_data = None
         original_path = None
+        pin = None
         for part in parts:
             if b'name="pdf"' in part:
                 _, pdf_data = part.split(b'\r\n\r\n', 1)
@@ -305,6 +305,9 @@ class MyRequestHandler(BaseHTTPRequestHandler):
             if b'name="original_path"' in part:
                 _, original_path_data = part.split(b'\r\n\r\n', 1)
                 original_path = original_path_data.rstrip(b'\r\n--').decode('utf-8')
+            if b'name="pin"' in part:
+                _, pin_data = part.split(b'\r\n\r\n', 1)
+                pin = pin_data.rstrip(b'\r\n--').decode('utf-8')
         if not pdf_data:
             self.send_response(400)
             self.send_header('Access-Control-Allow-Origin', '*')
@@ -312,12 +315,19 @@ class MyRequestHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(b'No PDF provided')
             return
-        if not original_path or not os.path.isfile(original_path):
+        if not original_path:
             self.send_response(400)
             self.send_header('Access-Control-Allow-Origin', '*')
             self.send_header('Content-Type', 'text/plain')
             self.end_headers()
             self.wfile.write(b'Invalid or missing original file path')
+            return
+        if not pin:
+            self.send_response(400)
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.send_header('Content-Type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(b'PIN not provided')
             return
         # Save PDF to temporary file for processing
         input_path = os.path.join(tempfile.gettempdir(), f'pdf_{uuid.uuid4()}.pdf')
@@ -325,7 +335,7 @@ class MyRequestHandler(BaseHTTPRequestHandler):
             f.write(pdf_data)
         ID = str(uuid.uuid4())
         ev = threading.Event()
-        self.server.app.sign_queue.put((ID, input_path, original_path, ev))
+        self.server.app.sign_queue.put((ID, input_path, original_path, pin, ev))
         ev.wait()
         with self.server.app.sign_lock:
             status, result_path = self.server.app.sign_results.pop(ID)

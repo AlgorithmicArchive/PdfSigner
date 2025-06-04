@@ -20,6 +20,7 @@ from endesive.pdf import cms
 import pkcs11
 from pikepdf import Pdf, Dictionary, Array, Name, String
 from io import BytesIO
+import json
 
 # Configure logging
 logging.basicConfig(
@@ -131,18 +132,15 @@ class SignPDFApp(QWidget):
     def process_sign_queue(self):
         """Process items in the signing queue."""
         while not self.sign_queue.empty():
-            ID, input_path, original_path, event = self.sign_queue.get()
+            ID, input_path, original_path, pin, event = self.sign_queue.get()
             if not self.lib_path:
                 with self.sign_lock:
                     self.sign_results[ID] = ("Library path not configured", None)
                 event.set()
                 continue
-            pin, ok = QInputDialog.getText(
-                self, 'Enter PIN', 'USB Token PIN:', QLineEdit.Password
-            )
-            if not ok or not pin:
+            if not pin:
                 with self.sign_lock:
-                    self.sign_results[ID] = ("User cancelled", None)
+                    self.sign_results[ID] = ("PIN not provided in POST request", None)
                 event.set()
                 continue
             try:
@@ -302,6 +300,30 @@ class SignPDFApp(QWidget):
                     os.remove(input_path)
                 return output.getvalue()
 
+    def get_certificates(self, pin):
+        """Retrieve a list of certificates from the USB token."""
+        if not self.lib_path:
+            raise RuntimeError("Library path not configured")
+        lib = pkcs11.lib(self.lib_path)
+        slots = lib.get_slots(token_present=True)
+        if not slots:
+            raise RuntimeError("No USB token detected")
+        with slots[0].get_token().open(user_pin=pin) as session:
+            cert_objects = session.get_objects({
+                pkcs11.Attribute.CLASS: pkcs11.ObjectClass.CERTIFICATE,
+                pkcs11.Attribute.CERTIFICATE_TYPE: pkcs11.CertificateType.X_509,
+            })
+            certificates = []
+            for cert_obj in cert_objects:
+                cert_der = cert_obj[pkcs11.Attribute.VALUE]
+                cert = load_der_x509_certificate(cert_der, default_backend())
+                certificates.append({
+                    'serial_number': str(cert.serial_number),  # Convert to string for JSON compatibility
+                    'expiration_date': cert.not_valid_after.isoformat(),  # Add expiration date
+                    'certifying_authority': cert.issuer.rfc4514_string() 
+                })
+            return certificates
+
 class MyRequestHandler(BaseHTTPRequestHandler):
     """Handle HTTP requests for PDF signing."""
     def do_OPTIONS(self):
@@ -313,70 +335,128 @@ class MyRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_POST(self):
-        """Handle POST requests to sign PDFs."""
-        if self.path != '/sign':
+        """Handle POST requests for signing PDFs or retrieving certificates."""
+        if self.path == '/sign':
+            # Existing /sign endpoint code remains unchanged
+            ct = self.headers.get('Content-Type', '')
+            m = re.match(r'multipart/form-data; boundary=(.+)', ct)
+            if not m:
+                self.send_response(400)
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.send_header('Content-Type', 'text/plain')
+                self.end_headers()
+                self.wfile.write(b'Invalid content type')
+                return
+            boundary = m.group(1).encode()
+            length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(length)
+            parts = body.split(b'--' + boundary)
+            pdf_data = None
+            original_path = None
+            pin = None
+            for part in parts:
+                if b'name="pdf"' in part:
+                    _, pdf_data = part.split(b'\r\n\r\n', 1)
+                    pdf_data = pdf_data.rstrip(b'\r\n--')
+                if b'name="original_path"' in part:
+                    _, original_path_data = part.split(b'\r\n\r\n', 1)
+                    original_path = original_path_data.rstrip(b'\r\n--').decode('utf-8')
+                if b'name="pin"' in part:
+                    _, pin_data = part.split(b'\r\n\r\n', 1)
+                    pin = pin_data.rstrip(b'\r\n--').decode('utf-8')
+            if not pdf_data:
+                self.send_response(400)
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.send_header('Content-Type', 'text/plain')
+                self.end_headers()
+                self.wfile.write(b'No PDF provided')
+                return
+            input_path = os.path.join(tempfile.gettempdir(), f'pdf_{uuid.uuid4()}.pdf')
+            with open(input_path, 'wb') as f:
+                f.write(pdf_data)
+            ID = str(uuid.uuid4())
+            ev = threading.Event()
+            self.server.app.sign_queue.put((ID, input_path, original_path, pin, ev))
+            ev.wait()
+            with self.server.app.sign_lock:
+                status, result = self.server.app.sign_results.pop(ID)
+            if status == "Success":
+                if isinstance(result, str) and os.path.isfile(result):
+                    with open(result, 'rb') as f:
+                        signed = f.read()
+                else:
+                    signed = result
+                self.send_response(200)
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.send_header('Content-Type', 'application/pdf')
+                self.end_headers()
+                self.wfile.write(signed)
+            else:
+                self.send_response(400)
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.send_header('Content-Type', 'text/plain')
+                self.end_headers()
+                self.wfile.write(status.encode())
+                if os.path.isfile(input_path):
+                    os.remove(input_path)
+
+        elif self.path == '/certificates':
+            # New /certificates endpoint
+            ct = self.headers.get('Content-Type', '')
+            m = re.match(r'multipart/form-data; boundary=(.+)', ct)
+            if not m:
+                self.send_response(400)
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.send_header('Content-Type', 'text/plain')
+                self.end_headers()
+                self.wfile.write(b'Invalid content type')
+                return
+            boundary = m.group(1).encode()
+            length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(length)
+            parts = body.split(b'--' + boundary)
+            pin = None
+            for part in parts:
+                if b'name="pin"' in part:
+                    _, pin_data = part.split(b'\r\n\r\n', 1)
+                    pin = pin_data.rstrip(b'\r\n--').decode('utf-8')
+            if not pin:
+                self.send_response(400)
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.send_header('Content-Type', 'text/plain')
+                self.end_headers()
+                self.wfile.write(b'PIN not provided')
+                return
+            try:
+                certificates = self.server.app.get_certificates(pin)
+                self.send_response(200)
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.send_header('Content-Type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps(certificates).encode())
+            except Exception as e:
+                self.send_response(500)
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.send_header('Content-Type', 'text/plain')
+                self.end_headers()
+                self.wfile.write(f"Error: {e}".encode())
+        else:
             self.send_response(404)
             self.send_header('Access-Control-Allow-Origin', '*')
             self.end_headers()
-            return
-        ct = self.headers.get('Content-Type', '')
-        m = re.match(r'multipart/form-data; boundary=(.+)', ct)
-        if not m:
-            self.send_response(400)
-            self.send_header('Access-Control-Allow-Origin', '*')
-            self.send_header('Content-Type', 'text/plain')
-            self.end_headers()
-            self.wfile.write(b'Invalid content type')
-            return
-        boundary = m.group(1).encode()
-        length = int(self.headers.get('Content-Length', 0))
-        body = self.rfile.read(length)
-        parts = body.split(b'--' + boundary)
-        pdf_data = None
-        original_path = None
-        for part in parts:
-            if b'name="pdf"' in part:
-                _, pdf_data = part.split(b'\r\n\r\n', 1)
-                pdf_data = pdf_data.rstrip(b'\r\n--')
-            if b'name="original_path"' in part:
-                _, original_path_data = part.split(b'\r\n\r\n', 1)
-                original_path = original_path_data.rstrip(b'\r\n--').decode('utf-8')
-        if not pdf_data:
-            self.send_response(400)
-            self.send_header('Access-Control-Allow-Origin', '*')
-            self.send_header('Content-Type', 'text/plain')
-            self.end_headers()
-            self.wfile.write(b'No PDF provided')
-            return
-        # Save PDF to temporary file for processing
-        input_path = os.path.join(tempfile.gettempdir(), f'pdf_{uuid.uuid4()}.pdf')
-        with open(input_path, 'wb') as f:
-            f.write(pdf_data)
-        ID = str(uuid.uuid4())
-        ev = threading.Event()
-        self.server.app.sign_queue.put((ID, input_path, original_path, ev))
-        ev.wait()
-        with self.server.app.sign_lock:
-            status, result = self.server.app.sign_results.pop(ID)
-        if status == "Success":
-            if isinstance(result, str) and os.path.isfile(result):  # original_path was provided
-                with open(result, 'rb') as f:
-                    signed = f.read()
-            else:  # original_path not provided, result is bytes
-                signed = result
+
+    def do_GET(self):
+        """Handle GET requests for health check."""
+        if self.path == '/':
             self.send_response(200)
             self.send_header('Access-Control-Allow-Origin', '*')
-            self.send_header('Content-Type', 'application/pdf')
-            self.end_headers()
-            self.wfile.write(signed)
-        else:
-            self.send_response(400)
-            self.send_header('Access-Control-Allow-Origin', '*')
             self.send_header('Content-Type', 'text/plain')
             self.end_headers()
-            self.wfile.write(status.encode())
-            if os.path.isfile(input_path):
-                os.remove(input_path)
+            self.wfile.write(b'OK')
+        else:
+            self.send_response(404)
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)
